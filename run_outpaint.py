@@ -17,7 +17,7 @@ from PIL import Image
 from safetensors.torch import load_model
 from transformers import CLIPTextModel
 
-from diffusers import UniPCMultistepScheduler
+from diffusers import AutoencoderKL, UniPCMultistepScheduler
 from powerpaint.models.BrushNet_CA import BrushNetModel
 from powerpaint.models.unet_2d_condition import UNet2DConditionModel
 from powerpaint.pipelines.pipeline_PowerPaint_Brushnet_CA import (
@@ -145,9 +145,21 @@ def build_pipeline(args: argparse.Namespace):
     print(f"Base model: {base_model_path}")
     print(f"PowerPaint weights: {brushnet_path.parent}")
 
-    source_unet = UNet2DConditionModel.from_pretrained(
+    unet = UNet2DConditionModel.from_pretrained(
         base_model_path,
         subfolder="unet",
+        torch_dtype=dtype,
+        local_files_only=args.local_files_only,
+    )
+    vae = AutoencoderKL.from_pretrained(
+        base_model_path,
+        subfolder="vae",
+        torch_dtype=dtype,
+        local_files_only=args.local_files_only,
+    )
+    text_encoder = CLIPTextModel.from_pretrained(
+        base_model_path,
+        subfolder="text_encoder",
         torch_dtype=dtype,
         local_files_only=args.local_files_only,
     )
@@ -157,31 +169,36 @@ def build_pipeline(args: argparse.Namespace):
         torch_dtype=dtype,
         local_files_only=args.local_files_only,
     )
-    brushnet = BrushNetModel.from_unet(source_unet)
-    del source_unet
-
-    pipe = StableDiffusionPowerPaintBrushNetPipeline.from_pretrained(
+    brushnet = BrushNetModel.from_unet(unet)
+    scheduler = UniPCMultistepScheduler.from_pretrained(
         base_model_path,
-        brushnet=brushnet,
-        text_encoder_brushnet=text_encoder_brushnet,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=False,
-        safety_checker=None,
+        subfolder="scheduler",
         local_files_only=args.local_files_only,
     )
-    # The repository uses its custom UNet implementation for BrushNet residuals.
-    pipe.unet = UNet2DConditionModel.from_pretrained(
-        base_model_path,
-        subfolder="unet",
-        torch_dtype=dtype,
-        local_files_only=args.local_files_only,
-    )
-    pipe.tokenizer = TokenizerWrapper(
+    tokenizer = TokenizerWrapper(
         from_pretrained=base_model_path,
         subfolder="tokenizer",
         revision=None,
         torch_type=dtype,
         local_files_only=args.local_files_only,
+    )
+
+    # Construct the custom pipeline explicitly. Newer Diffusers versions infer
+    # a stock diffusers.UNet2DConditionModel from model_index.json when using
+    # Pipeline.from_pretrained(), which is incompatible with PowerPaint's custom
+    # UNet and can also replace/mis-register the supplied BrushNet component.
+    pipe = StableDiffusionPowerPaintBrushNetPipeline(
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        unet=unet,
+        brushnet=brushnet,
+        text_encoder_brushnet=text_encoder_brushnet,
+        scheduler=scheduler,
+        safety_checker=None,
+        feature_extractor=None,
+        image_encoder=None,
+        requires_safety_checker=False,
     )
     add_tokens(
         tokenizer=pipe.tokenizer,
@@ -192,7 +209,6 @@ def build_pipeline(args: argparse.Namespace):
     )
     load_model(pipe.brushnet, str(brushnet_path))
     load_text_encoder_weights(pipe.text_encoder_brushnet, text_encoder_path)
-    pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
     pipe.vae.enable_slicing()
     pipe.vae.enable_tiling()
 
