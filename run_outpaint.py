@@ -26,7 +26,12 @@ from powerpaint.pipelines.pipeline_PowerPaint_Brushnet_CA import (
 from powerpaint.utils.utils import TokenizerWrapper, add_tokens
 
 
-DEFAULT_POWERPAINT_DIR = "/mnt/DataPart/jianghongda/checkpoint/PowerPaint-v2-1"
+DEFAULT_POWERPAINT_DIR = (
+    "/mnt/DataPart/jianghongda/checkpoint/PowerPaint-v2-1/PowerPaint_Brushnet"
+)
+DEFAULT_BASE_MODEL_PATH = (
+    "/mnt/DataPart/jianghongda/checkpoint/PowerPaint-v2-1/realisticVisionV60B1_v51VAE"
+)
 BASE_MODEL_FOLDER = "realisticVisionV60B1_v51VAE"
 
 
@@ -43,10 +48,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--base_model_path",
-        default=None,
+        default=DEFAULT_BASE_MODEL_PATH,
         help=(
-            "Diffusers-format realisticVisionV60B1_v51VAE directory. If omitted, the script "
-            "looks inside and next to --powerpaint_model_dir."
+            "Diffusers-format realisticVisionV60B1_v51VAE directory."
         ),
     )
     parser.add_argument("--prompt", default="", help="Optional scene description.")
