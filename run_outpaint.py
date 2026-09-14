@@ -59,6 +59,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guidance_scale", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
+        "--outpaint_mode",
+        choices=("two_stage", "one_stage"),
+        default="two_stage",
+        help="two_stage expands left/right first and then top/bottom for better large outpainting.",
+    )
+    parser.add_argument(
         "--model_input_short_side",
         type=int,
         default=512,
@@ -71,10 +77,9 @@ def parse_args() -> argparse.Namespace:
         help="Working-resolution pixels masked inside the original image to improve seams.",
     )
     parser.add_argument(
-        "--final_feather",
-        type=int,
-        default=24,
-        help="Final-resolution pixels used to blend the original image back into the center.",
+        "--save_intermediate",
+        action="store_true",
+        help="Save the horizontal first-pass result next to the final output.",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="float16")
@@ -246,49 +251,50 @@ def prepare_canvas(image: Image.Image, short_side: int, seam_overlap: int):
     return resized, canvas, mask
 
 
-def composite_original(
-    generated: Image.Image, original: Image.Image, feather: int
+def prepare_directional_canvas(
+    image: Image.Image, direction: str, seam_overlap: int
+) -> Tuple[Image.Image, Image.Image]:
+    width, height = image.size
+    overlap = max(0, min(seam_overlap, width // 4, height // 4))
+
+    if direction == "horizontal":
+        canvas = Image.new("RGB", (width * 2, height), (127, 127, 127))
+        left = width // 2
+        canvas.paste(image, (left, 0))
+        mask_array = np.full((height, width * 2, 3), 255, dtype=np.uint8)
+        mask_array[:, left + overlap : left + width - overlap] = 0
+    elif direction == "vertical":
+        canvas = Image.new("RGB", (width, height * 2), (127, 127, 127))
+        top = height // 2
+        canvas.paste(image, (0, top))
+        mask_array = np.full((height * 2, width, 3), 255, dtype=np.uint8)
+        mask_array[top + overlap : top + height - overlap, :] = 0
+    else:
+        raise ValueError(f"Unsupported outpainting direction: {direction}")
+
+    return canvas, Image.fromarray(mask_array, mode="RGB")
+
+
+def run_powerpaint(
+    pipe,
+    canvas: Image.Image,
+    mask: Image.Image,
+    positive: str,
+    negative_prompt: str,
+    args: argparse.Namespace,
+    seed: int,
 ) -> Image.Image:
-    original_w, original_h = original.size
-    target = generated.resize((original_w * 2, original_h * 2), Image.Resampling.LANCZOS)
-    left, top = original_w // 2, original_h // 2
-
-    feather = max(0, min(feather, original_w // 4, original_h // 4))
-    if feather == 0:
-        target.paste(original, (left, top))
-        return target
-
-    y, x = np.ogrid[:original_h, :original_w]
-    horizontal = np.minimum(x, original_w - 1 - x)
-    vertical = np.minimum(y, original_h - 1 - y)
-    distance = np.minimum(horizontal, vertical).astype(np.float32)
-    alpha = np.clip(distance / feather, 0.0, 1.0)
-    alpha = Image.fromarray(np.uint8(alpha * 255), mode="L")
-    target.paste(original, (left, top), alpha)
-    return target
-
-
-@torch.inference_mode()
-def main() -> None:
-    args = parse_args()
-    original = Image.open(args.input).convert("RGB")
-    pipe = build_pipeline(args)
-    _, canvas, mask = prepare_canvas(original, args.model_input_short_side, args.seam_overlap)
-
-    positive = f"{args.prompt.strip()} empty scene".strip()
     prompt_a = f"{positive} P_ctxt"
-    prompt_b = prompt_a
-    negative_a = f"{args.negative_prompt.strip()} P_obj".strip()
-    negative_b = negative_a
+    negative_a = f"{negative_prompt.strip()} P_obj".strip()
 
     mask_array = np.asarray(mask, dtype=np.float32) / 255.0
     masked_array = np.asarray(canvas, dtype=np.float32) * (1.0 - mask_array)
     masked_image = Image.fromarray(masked_array.astype(np.uint8), mode="RGB")
-    generator = torch.Generator(device=args.device).manual_seed(args.seed)
+    generator = torch.Generator(device=args.device).manual_seed(seed)
 
-    result = pipe(
+    return pipe(
         promptA=prompt_a,
-        promptB=prompt_b,
+        promptB=prompt_a,
         promptU=positive,
         tradoff=1.0,
         tradoff_nag=1.0,
@@ -298,16 +304,78 @@ def main() -> None:
         generator=generator,
         brushnet_conditioning_scale=1.0,
         negative_promptA=negative_a,
-        negative_promptB=negative_b,
-        negative_promptU=args.negative_prompt,
+        negative_promptB=negative_a,
+        negative_promptU=negative_prompt,
         guidance_scale=args.guidance_scale,
         width=canvas.width,
         height=canvas.height,
     ).images[0]
 
-    final = composite_original(result, original, args.final_feather)
+
+@torch.inference_mode()
+def main() -> None:
+    args = parse_args()
+    original = Image.open(args.input).convert("RGB")
+    pipe = build_pipeline(args)
+    work_w, work_h = aligned_working_size(
+        *original.size, args.model_input_short_side
+    )
+    working_image = original.resize((work_w, work_h), Image.Resampling.LANCZOS)
+    positive = f"{args.prompt.strip()} empty scene".strip()
     output_path = Path(args.output).expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.outpaint_mode == "two_stage":
+        horizontal_canvas, horizontal_mask = prepare_directional_canvas(
+            working_image, "horizontal", args.seam_overlap
+        )
+        horizontal_result = run_powerpaint(
+            pipe,
+            horizontal_canvas,
+            horizontal_mask,
+            positive,
+            args.negative_prompt,
+            args,
+            args.seed,
+        )
+        if args.save_intermediate:
+            intermediate_path = output_path.with_name(
+                f"{output_path.stem}_horizontal{output_path.suffix}"
+            )
+            horizontal_result.save(intermediate_path)
+            print(f"Saved horizontal pass to: {intermediate_path}")
+
+        vertical_canvas, vertical_mask = prepare_directional_canvas(
+            horizontal_result, "vertical", args.seam_overlap
+        )
+        result = run_powerpaint(
+            pipe,
+            vertical_canvas,
+            vertical_mask,
+            positive,
+            args.negative_prompt,
+            args,
+            args.seed + 1,
+        )
+    else:
+        _, canvas, mask = prepare_canvas(
+            original, args.model_input_short_side, args.seam_overlap
+        )
+        result = run_powerpaint(
+            pipe,
+            canvas,
+            mask,
+            positive,
+            args.negative_prompt,
+            args,
+            args.seed,
+        )
+
+    # Restore only the requested output dimensions. Do not paste the original
+    # image back: the saved image shows the model's actual complete prediction.
+    final = result.resize(
+        (original.width * 2, original.height * 2), Image.Resampling.LANCZOS
+    )
     final.save(output_path)
     print(f"Saved {final.width}x{final.height} result to: {output_path}")
 
