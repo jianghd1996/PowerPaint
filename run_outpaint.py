@@ -13,7 +13,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageFilter
 from safetensors.torch import load_model
 from transformers import CLIPTextModel
 
@@ -80,6 +80,12 @@ def parse_args() -> argparse.Namespace:
         "--save_intermediate",
         action="store_true",
         help="Save the horizontal first-pass result next to the final output.",
+    )
+    parser.add_argument(
+        "--final_feather",
+        type=int,
+        default=24,
+        help="Final-resolution seam width when restoring the exact original pixels.",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="float16")
@@ -312,6 +318,44 @@ def run_powerpaint(
     ).images[0]
 
 
+def preserve_known_region(
+    generated: Image.Image,
+    known_canvas: Image.Image,
+    generation_mask: Image.Image,
+    feather_radius: int,
+) -> Image.Image:
+    """Keep unmasked pixels exact and feather only the mask boundary."""
+    blend_mask = generation_mask.convert("L")
+    if feather_radius > 0:
+        blend_mask = blend_mask.filter(
+            ImageFilter.GaussianBlur(radius=max(1, feather_radius // 2))
+        )
+    return Image.composite(generated.convert("RGB"), known_canvas.convert("RGB"), blend_mask)
+
+
+def restore_original_center(
+    generated: Image.Image, original: Image.Image, feather: int
+) -> Image.Image:
+    """Restore original-resolution center pixels with a narrow feathered seam."""
+    target_size = (original.width * 2, original.height * 2)
+    result = generated.resize(target_size, Image.Resampling.LANCZOS)
+    left, top = original.width // 2, original.height // 2
+
+    feather = max(0, min(feather, original.width // 4, original.height // 4))
+    if feather == 0:
+        result.paste(original, (left, top))
+        return result
+
+    y, x = np.ogrid[: original.height, : original.width]
+    horizontal = np.minimum(x, original.width - 1 - x)
+    vertical = np.minimum(y, original.height - 1 - y)
+    distance = np.minimum(horizontal, vertical).astype(np.float32)
+    alpha = np.clip(distance / feather, 0.0, 1.0)
+    alpha_mask = Image.fromarray(np.uint8(alpha * 255), mode="L")
+    result.paste(original, (left, top), alpha_mask)
+    return result
+
+
 @torch.inference_mode()
 def main() -> None:
     args = parse_args()
@@ -329,7 +373,7 @@ def main() -> None:
         horizontal_canvas, horizontal_mask = prepare_directional_canvas(
             working_image, "horizontal", args.seam_overlap
         )
-        horizontal_result = run_powerpaint(
+        horizontal_generated = run_powerpaint(
             pipe,
             horizontal_canvas,
             horizontal_mask,
@@ -337,6 +381,12 @@ def main() -> None:
             args.negative_prompt,
             args,
             args.seed,
+        )
+        horizontal_result = preserve_known_region(
+            horizontal_generated,
+            horizontal_canvas,
+            horizontal_mask,
+            args.seam_overlap,
         )
         if args.save_intermediate:
             intermediate_path = output_path.with_name(
@@ -348,7 +398,7 @@ def main() -> None:
         vertical_canvas, vertical_mask = prepare_directional_canvas(
             horizontal_result, "vertical", args.seam_overlap
         )
-        result = run_powerpaint(
+        vertical_generated = run_powerpaint(
             pipe,
             vertical_canvas,
             vertical_mask,
@@ -357,11 +407,17 @@ def main() -> None:
             args,
             args.seed + 1,
         )
+        result = preserve_known_region(
+            vertical_generated,
+            vertical_canvas,
+            vertical_mask,
+            args.seam_overlap,
+        )
     else:
         _, canvas, mask = prepare_canvas(
             original, args.model_input_short_side, args.seam_overlap
         )
-        result = run_powerpaint(
+        generated = run_powerpaint(
             pipe,
             canvas,
             mask,
@@ -370,12 +426,13 @@ def main() -> None:
             args,
             args.seed,
         )
+        result = preserve_known_region(
+            generated, canvas, mask, args.seam_overlap
+        )
 
-    # Restore only the requested output dimensions. Do not paste the original
-    # image back: the saved image shows the model's actual complete prediction.
-    final = result.resize(
-        (original.width * 2, original.height * 2), Image.Resampling.LANCZOS
-    )
+    # The diffusion model works at a reduced resolution. Restore the requested
+    # 2W x 2H size, then put the untouched source pixels back into the center.
+    final = restore_original_center(result, original, args.final_feather)
     final.save(output_path)
     print(f"Saved {final.width}x{final.height} result to: {output_path}")
 
